@@ -13,7 +13,6 @@ from railforge.maintenance.release import releasable
 from railforge.possession.windows import conflicts as possession_conflicts
 from railforge.planning.loco_circulation import circulate
 from railforge.planning.train_path_engine import build, section_load, train_delay
-from railforge.routing.clearance import route_ok
 from railforge.signaling.block_occupancy import conflicts as block_conflicts
 from railforge.yard.hump import classify
 from railforge.yard.switching import lock_route
@@ -47,9 +46,14 @@ class RailForgeFeatureService:
         return self.control.run(operation_id, "feature.crew.handoff", operation_id, at, action)
 
     def check_route_clearance(self, operation_id, profile, segments, wagons, axle_limits, at):
+        clearance = self.control.check_clearance(
+            operation_id + ":clearance", profile, segments, operation_id, at
+        )
+
         def action():
-            if not route_ok(profile, segments):
-                raise ValueError("route clearance denied")
+            if not clearance.result:
+                failed = ",".join(c.segment_id for c in clearance.result.failed_segments)
+                raise ValueError("route clearance denied: " + failed)
             rejected = [w.id for w in wagons if not axle_limits(w)]
             if rejected:
                 raise ValueError("axle limit: " + ",".join(rejected))

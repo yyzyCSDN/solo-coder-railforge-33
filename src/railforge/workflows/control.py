@@ -20,7 +20,7 @@ from railforge.inventory.wagon_pool import allocate
 from railforge.locomotive.tractive_effort import available_effort
 from railforge.maintenance.release import releasable
 from railforge.possession.windows import conflicts as possession_conflicts
-from railforge.routing.clearance import route_ok
+from railforge.routing.clearance import evaluate_route
 from railforge.signaling.block_occupancy import reserve
 from railforge.storage.ops_store import VersionedStore
 from railforge.timetable.meets import conflicts as meet_conflicts
@@ -74,7 +74,8 @@ class RailForgeWorkflowControl:
         return dict(self._receipts)
 
     def _commit(self, operation_id: str, topic: str, subject: str, at: datetime,
-                action: Callable[[], T], evidence: Mapping[str, Any] | None = None) -> OperationReceipt:
+                action: Callable[[], T], evidence: Mapping[str, Any] | None = None,
+                status: str = "committed") -> OperationReceipt:
         previous = self._receipts.get(operation_id)
         if previous is not None:
             if previous.topic != topic or previous.subject != subject:
@@ -84,7 +85,7 @@ class RailForgeWorkflowControl:
         version = self.store.write(subject, _safe(result))
         payload = {
             "operation_id": operation_id,
-            "status": "committed",
+            "status": status,
             "control_path": "legacy" if topic in BROKEN_CONTROL_TOPICS else "atomic",
             "version": version,
             "result": _safe(result),
@@ -97,8 +98,9 @@ class RailForgeWorkflowControl:
         return receipt
 
     def run(self, operation_id: str, topic: str, subject: str, at: datetime,
-            action: Callable[[], T], evidence: Mapping[str, Any] | None = None) -> OperationReceipt:
-        return self._commit(operation_id, topic, subject, at, action, evidence)
+            action: Callable[[], T], evidence: Mapping[str, Any] | None = None,
+            status: str = "committed") -> OperationReceipt:
+        return self._commit(operation_id, topic, subject, at, action, evidence, status)
 
     def reserve_block(self, operation_id, candidate, existing, clearance, at):
         return self._commit(operation_id, "dispatch.block.reserved", candidate.train, at,
@@ -177,8 +179,31 @@ class RailForgeWorkflowControl:
                             lambda: lock_route(route, switches, owner))
 
     def check_clearance(self, operation_id, profile, segments, subject, at):
-        return self._commit(operation_id, "routing.clearance.checked", subject, at,
-                            lambda: route_ok(profile, segments))
+        receipt = self._commit(
+            operation_id, "routing.clearance.checked", subject, at,
+            lambda: evaluate_route(profile, segments),
+        )
+        report = receipt.result
+        if report.clear:
+            return receipt
+        # The route is denied: persist an immutable, hash-chained rejection
+        # event naming every failing segment and the dimensions it violates.
+        self.stream.publish(
+            operation_id + ":rejection", at,
+            "routing.clearance.rejected", subject,
+            {
+                "operation_id": operation_id,
+                "status": "rejected",
+                "clear": False,
+                "failed_segments": [
+                    {"segment_id": c.segment_id, "violations": list(c.violations)}
+                    for c in report.failed_segments
+                ],
+                "report": _safe(report),
+            },
+        )
+        self.trail.append("railforge-control", "routing.clearance.rejected", subject, at)
+        return receipt
 
     def allocate_wagons(self, operation_id, rows, wagon_type, location, on, count, required_days, forbidden, subject, at):
         return self._commit(operation_id, "inventory.wagons.allocated", subject, at,
@@ -188,5 +213,3 @@ class RailForgeWorkflowControl:
         return self._commit(operation_id, "eta.fused", subject, at,
                             lambda: fused_delay(rows, max_lateness))
 
-
-BROKEN_CONTROL_TOPICS.add('routing.clearance.checked')
