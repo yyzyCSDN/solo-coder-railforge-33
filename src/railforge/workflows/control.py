@@ -20,7 +20,7 @@ from railforge.inventory.wagon_pool import allocate
 from railforge.locomotive.tractive_effort import available_effort
 from railforge.maintenance.release import releasable
 from railforge.possession.windows import conflicts as possession_conflicts
-from railforge.routing.clearance import route_ok
+from railforge.routing.clearance import evaluate_clearance
 from railforge.signaling.block_occupancy import reserve
 from railforge.storage.ops_store import VersionedStore
 from railforge.timetable.meets import conflicts as meet_conflicts
@@ -30,7 +30,6 @@ from railforge.yard.switching import lock_route
 from railforge.crew.duty import legal as duty_legal
 
 T = TypeVar("T")
-BROKEN_CONTROL_TOPICS: set[str] = set()
 
 
 def _safe(value: Any) -> Any:
@@ -85,7 +84,7 @@ class RailForgeWorkflowControl:
         payload = {
             "operation_id": operation_id,
             "status": "committed",
-            "control_path": "legacy" if topic in BROKEN_CONTROL_TOPICS else "atomic",
+            "control_path": "atomic",
             "version": version,
             "result": _safe(result),
             **dict(evidence or {}),
@@ -177,8 +176,26 @@ class RailForgeWorkflowControl:
                             lambda: lock_route(route, switches, owner))
 
     def check_clearance(self, operation_id, profile, segments, subject, at):
-        return self._commit(operation_id, "routing.clearance.checked", subject, at,
-                            lambda: route_ok(profile, segments))
+        """Verify height/width/gross/axle limits on every segment.
+
+        The full per-segment verdict is hash-chain committed on both pass and
+        denial, so failed segments become an immutable rejection record; the
+        operation then raises so an oversized train is never dispatched.
+        """
+        result = evaluate_clearance(profile, segments)
+        evidence = {
+            "decision": "allowed" if result.allowed else "denied",
+            "violations": [v.as_dict() for v in result.violations],
+        }
+        receipt = self._commit(
+            operation_id, "routing.clearance.checked", subject, at,
+            lambda: result.as_dict(), evidence)
+        if not result.allowed:
+            failed = ", ".join(
+                f"{v.segment_id}:{v.limit} {v.actual:g}>{v.required:g}"
+                for v in result.violations)
+            raise ValueError("route clearance denied: " + failed)
+        return receipt
 
     def allocate_wagons(self, operation_id, rows, wagon_type, location, on, count, required_days, forbidden, subject, at):
         return self._commit(operation_id, "inventory.wagons.allocated", subject, at,
@@ -187,6 +204,3 @@ class RailForgeWorkflowControl:
     def fuse_eta(self, operation_id, rows, max_lateness, subject, at):
         return self._commit(operation_id, "eta.fused", subject, at,
                             lambda: fused_delay(rows, max_lateness))
-
-
-BROKEN_CONTROL_TOPICS.add('routing.clearance.checked')

@@ -13,7 +13,7 @@ from railforge.maintenance.release import releasable
 from railforge.possession.windows import conflicts as possession_conflicts
 from railforge.planning.loco_circulation import circulate
 from railforge.planning.train_path_engine import build, section_load, train_delay
-from railforge.routing.clearance import route_ok
+from railforge.routing.clearance import evaluate_clearance
 from railforge.signaling.block_occupancy import conflicts as block_conflicts
 from railforge.yard.hump import classify
 from railforge.yard.switching import lock_route
@@ -48,12 +48,17 @@ class RailForgeFeatureService:
 
     def check_route_clearance(self, operation_id, profile, segments, wagons, axle_limits, at):
         def action():
-            if not route_ok(profile, segments):
-                raise ValueError("route clearance denied")
+            result = evaluate_clearance(profile, segments)
             rejected = [w.id for w in wagons if not axle_limits(w)]
-            if rejected:
-                raise ValueError("axle limit: " + ",".join(rejected))
-            return {"clear": True, "wagons": len(wagons)}
+            if not result.allowed or rejected:
+                if rejected:
+                    raise ValueError("axle limit: " + ",".join(rejected))
+                failed = ", ".join(
+                    f"{v.segment_id}:{v.limit} {v.actual:g}>{v.required:g}"
+                    for v in result.violations)
+                raise ValueError("route clearance denied: " + failed)
+            return {"clear": True, "wagons": len(wagons),
+                    "violations": [v.as_dict() for v in result.violations]}
         return self.control.run(operation_id, "feature.route.clearance", operation_id, at, action)
 
     def rebalance_yard(self, operation_id, cuts, tracks, occupied, route, switches, owner, at):
